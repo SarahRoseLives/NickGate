@@ -23,12 +23,16 @@ NickGate is an SSH gateway for Ergo IRC users. It lets you log in using your Nic
 
 ---
 
-## ✅ Requirements
+## 🛠️ Notes for Developers
 
-- You must have a registered NickServ account on an Ergo IRC server with the API enabled.
-- Your password must be correct—authentication is done in real time via NickServ.
+We use environment variables `$NICK` and `$PASS` to store login credentials in memory so they can be passed on to other scripts easily.
+
+With the force command functionality, you're able to run a script of your choosing—this could be `weechat`, `irssi`, `tinyirc`, or something more custom.
+
+These environment variables are how you'll pass login information to your IRC client of choice.
 
 ---
+
 
 NickGate is designed for **accessing shared tools**, not general server use.
 
