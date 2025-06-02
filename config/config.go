@@ -11,6 +11,7 @@ type Config struct {
         SSHPort              string
         HostKeyFile          string
         ForceCommand         string
+        ForceOnExitCommand   string
         RealIPFallback       string
         ProxyProtocolEnabled bool
         ProxyAllowedIPs      []net.IPNet
@@ -32,6 +33,7 @@ func Load(path string) (*Config, error) {
         cfg.SSHPort = serverSection.Key("port").MustString("2222")
         cfg.HostKeyFile = serverSection.Key("host_key_file").String()
         cfg.ForceCommand = serverSection.Key("force_command").String()
+        cfg.ForceOnExitCommand = serverSection.Key("forceonexit").String()
         cfg.RealIPFallback = serverSection.Key("real_ip_fallback").MustString("127.0.0.1")
         cfg.ProxyProtocolEnabled = serverSection.Key("proxy_protocol_enabled").MustBool(false)
 
