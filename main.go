@@ -9,6 +9,7 @@ import (
         "os/exec"
         "os/signal"
         "path/filepath"
+        "strings"
         "syscall"
         "time"
         "unsafe"
@@ -32,6 +33,7 @@ type Server struct {
         sshPort              string
         hostKeyFile          string
         forceCmd             string
+        forceOnExitCommand   string
         realIPFallback       string
         proxyProtocolEnabled bool
         proxyAllowedIPs      []net.IPNet
@@ -57,6 +59,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
                 sshPort:              cfg.SSHPort,
                 hostKeyFile:          cfg.HostKeyFile,
                 forceCmd:             cfg.ForceCommand,
+                forceOnExitCommand:   cfg.ForceOnExitCommand,
                 realIPFallback:       cfg.RealIPFallback,
                 proxyProtocolEnabled: cfg.ProxyProtocolEnabled,
                 proxyAllowedIPs:      cfg.ProxyAllowedIPs,
@@ -289,6 +292,34 @@ func (s *Server) handleSession(newChannel ssh.NewChannel, permissions *ssh.Permi
         signal.Stop(sigch)
         close(sigch)
 
+        // Run forceOnExitCommand in a new goroutine
+        if s.forceOnExitCommand != "" {
+                go func(cmdStr, nick string) {
+                        // Substitute $NICK in the command string
+                        commandToRun := strings.ReplaceAll(cmdStr, "$NICK", nick)
+                        logger.Printf("Running force-on-exit command for %s: %s", nick, commandToRun)
+
+                        // Split the command string into command and arguments
+                        parts := strings.Fields(commandToRun)
+                        if len(parts) == 0 {
+                                logger.Printf("Force-on-exit command is empty after substitution for %s", nick)
+                                return
+                        }
+                        exitCmd := exec.Command(parts[0], parts[1:]...)
+                        exitCmd.Env = os.Environ() // Inherit environment variables
+
+                        // Discard stdout and stderr to run truly in background
+                        exitCmd.Stdout = nil
+                        exitCmd.Stderr = nil
+
+                        if err := exitCmd.Start(); err != nil {
+                                logger.Printf("Failed to start force-on-exit command for %s: %v", nick, err)
+                                return
+                        }
+                        // We don't wait for it to complete
+                        logger.Printf("Force-on-exit command started in background for %s (PID: %d)", nick, exitCmd.Process.Pid)
+                }(s.forceOnExitCommand, user)
+        }
 }
 
 func parseDims(b []byte) (width, height uint32) {
@@ -331,7 +362,6 @@ func (s *Server) Start() error {
                 logger.Printf("PROXY protocol disabled.")
         }
 
-
         logger.Printf("Server started on port %s (forcecommand=%s)", s.sshPort, s.forceCmd)
 
         for {
@@ -370,5 +400,4 @@ func main() {
         if err := server.Start(); err != nil {
                 log.Fatalf("Server crashed: %v", err)
         }
-
 }
