@@ -1,6 +1,7 @@
 package main
 
 import (
+        "context"
         "flag"
         "io"
         "log"
@@ -148,7 +149,7 @@ func (s *Server) handleConnection(conn net.Conn) {
         } else {
                 if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
                         realIP = host
-                }
+                        }
         }
 
         sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.config)
@@ -210,7 +211,7 @@ func (s *Server) handleSession(newChannel ssh.NewChannel, permissions *ssh.Permi
                 logger.Printf("Could not accept channel: %v", err)
                 return
         }
-        defer channel.Close()
+        defer channel.Close() // Ensure channel is closed when handleSession exits
 
         user := permissions.Extensions["user"]
         remoteAddr := permissions.Extensions["remote-addr"]
@@ -236,18 +237,14 @@ func (s *Server) handleSession(newChannel ssh.NewChannel, permissions *ssh.Permi
                 channel.Close()
                 return
         }
-        defer ptmx.Close()
+        defer ptmx.Close() // Ensure ptmx is closed when handleSession exits
 
-        sigch := make(chan os.Signal, 1)
-        signal.Notify(sigch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-        go func() {
-                for sig := range sigch {
-                        if cmd.Process != nil {
-                                cmd.Process.Signal(sig)
-                        }
-                }
-        }()
+        // Create a context that will be cancelled when either the command exits
+        // or the SSH channel/PTY connection breaks.
+        ctx, cancel := context.WithCancel(context.Background())
+        defer cancel() // Ensure the context is cancelled
 
+        // Goroutine to handle SSH channel requests (pty-req, window-change, shell, exec)
         go func() {
                 for req := range requests {
                         switch req.Type {
@@ -273,33 +270,79 @@ func (s *Server) handleSession(newChannel ssh.NewChannel, permissions *ssh.Permi
                                 }
                         }
                 }
+                // If the requests channel closes (client disconnects), cancel the context
+                cancel()
         }()
 
+        // Goroutine to copy data from SSH channel to PTY (user input)
         go func() {
-                io.Copy(channel, ptmx)
-        }()
-        go func() {
-                io.Copy(ptmx, channel)
+                _, err := io.Copy(ptmx, channel)
+                if err != nil && err != io.EOF {
+                        logger.Printf("Error copying from SSH channel to PTY for user %s: %v", user, err)
+                }
+                cancel() // Signal that the channel-to-pty copy is done (likely due to channel closure)
         }()
 
-        err = cmd.Wait()
-        if err != nil {
-                logger.Printf("Command finished with error for %s: %v", user, err)
-        } else {
-                logger.Printf("Command completed successfully for %s", user)
+        // Goroutine to copy data from PTY to SSH channel (command output)
+        go func() {
+                _, err := io.Copy(channel, ptmx)
+                if err != nil && err != io.EOF {
+                        logger.Printf("Error copying from PTY to SSH channel for user %s: %v", user, err)
+                }
+                cancel() // Signal that the pty-to-channel copy is done (likely due to channel closure)
+        }()
+
+        // Signal handling for the child process
+        sigch := make(chan os.Signal, 1)
+        signal.Notify(sigch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+        go func() {
+                select {
+                case sig := <-sigch:
+                        if cmd.Process != nil {
+                                cmd.Process.Signal(sig)
+                        }
+                case <-ctx.Done(): // Exit this goroutine if the context is cancelled
+                        return
+                }
+        }()
+
+        // Wait for either the command to finish or the SSH session to end
+        select {
+        case cmdErr := <-(func() chan error {
+                ch := make(chan error, 1)
+                go func() {
+                        ch <- cmd.Wait() // Wait for the command to exit
+                }()
+                return ch
+        }()):
+                // The command exited normally or with an error.
+                if cmdErr != nil {
+                        logger.Printf("Command finished with error for %s: %v", user, cmdErr)
+                } else {
+                        logger.Printf("Command completed successfully for %s", user)
+                }
+        case <-ctx.Done():
+                // The SSH channel or PTY connection broke, indicating an unexpected session end.
+                logger.Printf("Session for user %s ended unexpectedly (SSH channel or PTY connection closed).", user)
+                if cmd.Process != nil {
+                        logger.Printf("Attempting to kill forceCmd process (PID: %d) for user %s...", cmd.Process.Pid, user)
+                        if err := cmd.Process.Kill(); err != nil {
+                                logger.Printf("Failed to kill forceCmd process for %s: %v", user, err)
+                        } else {
+                                logger.Printf("ForceCmd process for %s killed successfully.", user)
+                        }
+                }
         }
 
         signal.Stop(sigch)
         close(sigch)
 
-        // Run forceOnExitCommand in a new goroutine
+        // Run forceOnExitCommand in a new goroutine if defined
         if s.forceOnExitCommand != "" {
                 go func(cmdStr, nick string) {
-                        // Substitute $NICK in the command string
                         commandToRun := strings.ReplaceAll(cmdStr, "$NICK", nick)
                         logger.Printf("Running force-on-exit command for %s: %s", nick, commandToRun)
 
-                        // Split the command string into command and arguments
                         parts := strings.Fields(commandToRun)
                         if len(parts) == 0 {
                                 logger.Printf("Force-on-exit command is empty after substitution for %s", nick)
@@ -308,15 +351,13 @@ func (s *Server) handleSession(newChannel ssh.NewChannel, permissions *ssh.Permi
                         exitCmd := exec.Command(parts[0], parts[1:]...)
                         exitCmd.Env = os.Environ() // Inherit environment variables
 
-                        // Discard stdout and stderr to run truly in background
-                        exitCmd.Stdout = nil
+                        exitCmd.Stdout = nil // Discard stdout and stderr
                         exitCmd.Stderr = nil
 
                         if err := exitCmd.Start(); err != nil {
                                 logger.Printf("Failed to start force-on-exit command for %s: %v", nick, err)
                                 return
                         }
-                        // We don't wait for it to complete
                         logger.Printf("Force-on-exit command started in background for %s (PID: %d)", nick, exitCmd.Process.Pid)
                 }(s.forceOnExitCommand, user)
         }
@@ -353,7 +394,6 @@ func (s *Server) Start() error {
 
         var finalListener net.Listener = listener
 
-        // Wrap listener with PROXY protocol support if enabled
         if s.proxyProtocolEnabled {
                 finalListener = &proxyproto.Listener{Listener: listener}
                 defer finalListener.Close()
